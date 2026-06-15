@@ -1,0 +1,53 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy-dbt:
+    name: Deploy dbt models to Snowflake
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: Configure Snowflake key-pair auth
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh ~/.dbt
+          printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > ~/.ssh/snowflake_rsa.p8
+          chmod 600 ~/.ssh/snowflake_rsa.p8
+          cat > ~/.dbt/profiles.yml <<EOF
+          banking_dbt:
+            target: prod
+            outputs:
+              prod:
+                type: snowflake
+                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+                user: ${{ secrets.SNOWFLAKE_USER }}
+                private_key_path: /home/runner/.ssh/snowflake_rsa.p8
+                role: ACCOUNTADMIN
+                database: BANKING
+                warehouse: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+                schema: ANALYTICS
+                threads: 4
+          EOF
+
+      - name: Run dbt pipeline
+        run: |
+          cd banking_dbt
+          dbt deps
+          dbt run
+          dbt snapshot
+          dbt run --select marts
+          dbt test

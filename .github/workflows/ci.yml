@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint Python
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check .
+
+  postgres-tests:
+    name: Postgres integration
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary
+
+      - name: Apply banking schema
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg2
+
+          conn = psycopg2.connect(
+              host=os.environ["POSTGRES_HOST"],
+              port=os.environ["POSTGRES_PORT"],
+              dbname=os.environ["POSTGRES_DB"],
+              user=os.environ["POSTGRES_USER"],
+              password=os.environ["POSTGRES_PASSWORD"],
+          )
+          conn.autocommit = True
+          with open("postgres/schema.sql", encoding="utf-8") as schema_file:
+              sql = schema_file.read()
+          with conn.cursor() as cur:
+              cur.execute(sql)
+          with conn.cursor() as cur:
+              cur.execute(
+                  "SELECT table_name FROM information_schema.tables "
+                  "WHERE table_schema = 'public' ORDER BY table_name"
+              )
+              tables = [row[0] for row in cur.fetchall()]
+          conn.close()
+          expected = {"accounts", "customers", "transactions"}
+          assert expected.issubset(set(tables)), f"Missing tables: {expected - set(tables)}"
+          print(f"Postgres schema ready: {', '.join(tables)}")
+          PY
+
+  dbt-parse:
+    name: Validate dbt project
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: Parse dbt project
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml <<EOF
+          banking_dbt:
+            target: dev
+            outputs:
+              dev:
+                type: snowflake
+                account: placeholder
+                user: placeholder
+                password: placeholder
+                role: ACCOUNTADMIN
+                database: BANKING
+                warehouse: COMPUTE_WH
+                schema: ANALYTICS
+          EOF
+          cd banking_dbt
+          dbt parse
+
+  dbt-compile:
+    name: Compile dbt against Snowflake
+    runs-on: ubuntu-latest
+    needs: [lint, dbt-parse, postgres-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: Configure Snowflake key-pair auth
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh ~/.dbt
+          printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > ~/.ssh/snowflake_rsa.p8
+          chmod 600 ~/.ssh/snowflake_rsa.p8
+          cat > ~/.dbt/profiles.yml <<EOF
+          banking_dbt:
+            target: dev
+            outputs:
+              dev:
+                type: snowflake
+                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+                user: ${{ secrets.SNOWFLAKE_USER }}
+                private_key_path: /home/runner/.ssh/snowflake_rsa.p8
+                role: ACCOUNTADMIN
+                database: BANKING
+                warehouse: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+                schema: ANALYTICS
+                threads: 4
+          EOF
+
+      - name: dbt compile
+        run: |
+          cd banking_dbt
+          dbt deps
+          dbt compile

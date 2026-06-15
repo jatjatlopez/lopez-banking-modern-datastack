@@ -1,0 +1,16 @@
+line-length = 120
+target-version = "py311"
+
+exclude = [
+    ".git",
+    "banking_dbt/target",
+    "banking_dbt/logs",
+    "banking_dbt/dbt_packages",
+    "docker/logs",
+    "docker/postgres",
+    "docker/minio",
+]
+
+[lint]
+select = ["E", "F"]
+ignore = ["E501"]

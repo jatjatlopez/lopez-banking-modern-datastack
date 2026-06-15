@@ -1,0 +1,724 @@
+================================================================================
+  BANKING MODERN DATA STACK — COMPLETE LEARNING GUIDE
+  Author: John Lopez | Project: lopez-banking-modern-datastack
+  Read this top to bottom once, then use Sections 12–14 as your daily reference.
+================================================================================
+
+
+TABLE OF CONTENTS
+-----------------
+  1.  The one-sentence summary
+  2.  The master analogy (read this first)
+  3.  Why this EXACT tech stack?
+  4.  Why Docker must run first
+  5.  The full process (step by step)
+  6.  Trace one customer record (the "aha" exercise)
+  7.  Medallion architecture (Bronze → Silver → Gold)
+  8.  Key concepts every data engineer must know
+  9.  What each folder/file does
+  10. Who does what: Airflow vs dbt vs Python scripts
+  11. Your Windows-specific setup (important)
+  12. Daily startup checklist (tomorrow morning)
+  13. CI/CD — what GitHub Actions does for you
+  14. What's done vs what's left (Power BI)
+  15. Interview pitch (30 seconds)
+  16. Self-test quiz (with answers)
+  17. Learning milestones — how to know you truly understand
+  18. Common failures and what they mean
+  19. Study plan (1 week)
+
+
+================================================================================
+1. THE ONE-SENTENCE SUMMARY
+================================================================================
+
+You built a fake bank in PostgreSQL, streamed every change in real time through
+Kafka, stored raw files in MinIO, loaded them into Snowflake with Airflow,
+transformed them into analytics tables with dbt, and automated quality checks
+with GitHub Actions — so a BI tool (Power BI) can answer business questions.
+
+
+================================================================================
+2. THE MASTER ANALOGY — A BANK WITH A HEAD OFFICE
+================================================================================
+
+Imagine a real bank with a branch, a security system, a warehouse, and HQ.
+
+  REAL WORLD                          YOUR PROJECT
+  ----------                          ------------
+  Bank branch                         PostgreSQL (OLTP)
+  (customers open accounts,           customers, accounts, transactions
+   money moves daily)
+
+  Security cameras on every change    Debezium (CDC)
+  (records who changed what)          reads Postgres WAL journal
+
+  Internal messenger tubes            Kafka
+  (carries change events fast)        topics per table
+
+  Loading dock / storage unit         MinIO
+  (boxes of records shelved)          Parquet files in "raw" bucket
+
+  Warehouse manager with a calendar   Airflow
+  (schedules when trucks run)         DAGs on a schedule
+
+  Corporate headquarters filing       Snowflake
+  system (huge, for reporting)        cloud data warehouse
+
+  Analyst team organizing reports     dbt
+  (cleans + builds report tables)     staging, snapshots, marts
+
+  Executive dashboards on the wall    Power BI (you still add this)
+
+  Building inspector before opening   GitHub Actions CI/CD
+  (checks code + runs tests)          lint, dbt, deploy
+
+  Shipping containers for all rooms   Docker
+  (same setup on any computer)        runs everything locally
+
+THE KEY INSIGHT:
+  The branch (Postgres) is built for FAST daily transactions.
+  HQ (Snowflake) is built for BIG analytical questions.
+  You never ask "how many customers joined last month?" by scanning every
+  teller's notebook — you copy changes to HQ and organize them there.
+
+
+================================================================================
+3. WHY THIS EXACT TECH STACK?
+================================================================================
+
+Each tool solves ONE problem. Together they mirror what real companies use.
+
+--------------------------------------------------------------------------------
+POSTGRESQL — the source (OLTP database)
+--------------------------------------------------------------------------------
+WHY:  Banks need ACID transactions (money must never disappear).
+      Relational tables with foreign keys fit banking data perfectly.
+WHY NOT Excel/CSV:  No real-time updates, no constraints, not production-grade.
+WHY NOT Snowflake as source:  Snowflake is for analytics, not live teller systems.
+
+YOUR TABLES:
+  customers   → who banks with you
+  accounts    → savings/checking per customer
+  transactions → deposits, withdrawals, transfers
+
+--------------------------------------------------------------------------------
+KAFKA + ZOOKEEPER — the event highway
+--------------------------------------------------------------------------------
+WHY:  When thousands of changes happen per second, you need a durable queue.
+      Kafka buffers events so slow consumers don't crash the bank system.
+WHY NOT read Postgres directly every minute:  Misses timing, loads the DB, not
+      truly event-driven.
+ZOOKEEPER:  Kafka's coordination service (manages cluster state). You rarely
+      touch it directly — it just needs to run.
+
+--------------------------------------------------------------------------------
+DEBEZIUM — Change Data Capture (CDC)
+--------------------------------------------------------------------------------
+WHY:  Captures INSERT / UPDATE / DELETE from Postgres without changing app code.
+HOW:  Reads the WAL (Write-Ahead Log) — Postgres's private journal of every change.
+WHY NOT nightly full dump:  Wasteful, slow, loses delete events, not real-time.
+OUTPUT:  JSON events on Kafka topics like:
+  banking_server.public.customers
+  banking_server.public.accounts
+  banking_server.public.transactions
+
+Postgres must run with wal_level=logical (already set in docker-compose.yml).
+
+--------------------------------------------------------------------------------
+MINIO — object storage (S3-compatible)
+--------------------------------------------------------------------------------
+WHY:  Cheap place to land raw files before the warehouse. Decouples streaming
+      from loading. In production this is often AWS S3.
+WHY NOT load Kafka straight into Snowflake:  Possible, but object storage is
+      the industry pattern — replayable, cheap, schema-flexible landing zone.
+FORMAT:  Parquet (columnar, compressed, analytics-friendly).
+
+--------------------------------------------------------------------------------
+PYTHON CONSUMER (kafka_to_minio.py) — the landing worker
+--------------------------------------------------------------------------------
+WHY:  Debezium puts events on Kafka; something must write files to MinIO.
+      This script batches events and saves Parquet.
+WHY NOT Debezium → S3 directly:  You'd need a different connector setup; this
+      project teaches the consumer pattern explicitly.
+RUNS:  On your Windows machine (outside Docker), must stay running.
+
+--------------------------------------------------------------------------------
+AIRFLOW — orchestration (the scheduler)
+--------------------------------------------------------------------------------
+WHY:  Pipelines have dependencies and schedules. "Every hour: download MinIO
+      files, then load Snowflake" — Airflow manages order, retries, logging.
+WHY NOT cron jobs:  No UI, no dependency graph, hard to monitor at scale.
+YOUR DAGS:
+  minio_to_snowflake_banking  → Bronze load (MinIO → Snowflake raw)
+  SCD2_snapshots              → runs dbt snapshot + marts on schedule
+
+Airflow does NOT transform data with business logic — it triggers work.
+
+--------------------------------------------------------------------------------
+SNOWFLAKE — cloud data warehouse (OLAP)
+--------------------------------------------------------------------------------
+WHY:  Separates storage and compute, scales for analytics, SQL-friendly,
+      industry standard for modern data teams.
+YOUR LAYOUT:
+  BANKING.RAW       → Bronze (landing zone from MinIO)
+  BANKING.ANALYTICS → where dbt builds staging, snapshots, marts
+
+WHY NOT keep everything in Postgres:  Analytics queries would slow down the
+      live bank system. Warehouses are optimized for reads and aggregations.
+
+--------------------------------------------------------------------------------
+dbt — transformation (the analytics engineer's tool)
+--------------------------------------------------------------------------------
+WHY:  Version-controlled SQL, tests, documentation, lineage — transforms raw
+      data into trusted business tables.
+WHY NOT giant stored procedures in Snowflake:  Hard to review, no Git workflow,
+      no standard testing pattern.
+YOUR MODELS:
+  Silver:  stg_customers, stg_accounts, stg_transactions (views)
+  SCD2:    customers_snapshot, accounts_snapshot (history tracking)
+  Gold:    dim_customers, dim_accounts, fact_transactions
+
+--------------------------------------------------------------------------------
+DOCKER — local infrastructure
+--------------------------------------------------------------------------------
+WHY:  Kafka + Debezium + Airflow + Postgres together = 8+ services with exact
+      versions. Docker runs them identically on any machine.
+See Section 4 for why Docker comes first.
+
+--------------------------------------------------------------------------------
+GITHUB ACTIONS — CI/CD
+--------------------------------------------------------------------------------
+WHY:  Every code push automatically lints Python, validates dbt, tests Postgres
+      schema, and deploys dbt models to Snowflake.
+WHY NOT manual dbt runs only:  Production teams need automated, repeatable deploys.
+
+--------------------------------------------------------------------------------
+POWER BI — visualization (not in repo yet)
+--------------------------------------------------------------------------------
+WHY:  Business users need charts, not SQL. Connects to Gold tables in Snowflake.
+WHY NOT skip it:  A pipeline without a consumer (dashboard) is incomplete for demos.
+
+
+================================================================================
+4. WHY DOCKER MUST RUN FIRST
+================================================================================
+
+Think of Docker as turning on the BUILDING before employees arrive.
+
+Without Docker running, these don't exist on your machine:
+  - Postgres (bank database)        → port 5434 on your PC (see Section 11)
+  - Kafka (event highway)           → port 29092
+  - Debezium Connect (CDC)          → port 8083
+  - MinIO (file storage)            → ports 9000 / 9001
+  - Airflow (scheduler + UI)        → port 8080
+
+WHAT DOCKER DOES:
+  1. Downloads pre-built images (Postgres 15, Kafka 7.4, etc.)
+  2. Creates an isolated network (banking-mds-net) so containers talk to each other
+  3. Persists data in volumes (your bank data survives restarts)
+  4. Maps ports so your Windows apps can connect (consumer, DBeaver, browser)
+
+ORDER OF DEPENDENCY:
+  Docker Desktop ON
+       ↓
+  docker compose up -d
+       ↓
+  Wait ~1–2 min for health
+       ↓
+  THEN register Debezium connector
+       ↓
+  THEN start Python consumer (needs Kafka + MinIO up)
+       ↓
+  THEN generate data / trigger Airflow
+
+WHAT RUNS OUTSIDE DOCKER (on your Windows machine):
+  - data-generator/faker_generator.py
+  - kafka-debezium/generate_and_post_connector.py
+  - consumer/kafka_to_minio.py
+  These need Python installed (see Section 11 — python not found fix).
+
+WHAT RUNS IN THE CLOUD (always available, no Docker needed):
+  - Snowflake (your warehouse)
+  - GitHub Actions (CI/CD)
+
+
+================================================================================
+5. THE FULL PROCESS (STEP BY STEP)
+================================================================================
+
+PHASE A — SET UP (once, or after docker compose down -v)
+---------------------------------------------------------
+  1. Configure .env files (root, consumer/, data-generator/, kafka-debezium/,
+     docker/dags/) — never commit these to Git.
+  2. Place Snowflake RSA key at docker/dags/secrets/rsa_key.p8
+  3. Configure banking_dbt/.dbt/profiles.yml for dbt
+  4. docker compose up -d
+  5. Apply postgres/schema.sql if fresh database (tables: customers, accounts,
+     transactions)
+
+PHASE B — GENERATE ACTIVITY (simulate the bank)
+------------------------------------------------
+  6. Run data-generator/faker_generator.py
+     → Inserts fake customers, accounts, transactions into Postgres
+     → Each INSERT is a "bank transaction" at the branch
+
+PHASE C — CAPTURE CHANGES (CDC)
+--------------------------------
+  7. Run kafka-debezium/generate_and_post_connector.py
+     → Registers Debezium to watch Postgres tables
+     → Status: http://localhost:8083/connectors
+
+  8. Run consumer/kafka_to_minio.py (keep terminal open)
+     → Reads Kafka topics
+     → Writes Parquet to MinIO bucket "raw"
+     → Path pattern: customers/date=YYYY-MM-DD/file.parquet
+
+PHASE D — LOAD WAREHOUSE (Bronze)
+----------------------------------
+  9. Airflow UI http://localhost:8080
+     → Enable + trigger DAG: minio_to_snowflake_banking
+     → Task 1: download_minio (pulls Parquet from MinIO)
+     → Task 2: load_snowflake (COPY into BANKING.RAW tables)
+
+PHASE E — TRANSFORM (Silver → Gold)
+------------------------------------
+  10. Run dbt (locally via run_dbt.ps1, inside Airflow container, or via CD):
+      dbt run          → staging views (Silver)
+      dbt snapshot     → SCD Type-2 history tables
+      dbt run --select marts  → dim_* and fact_* (Gold)
+
+PHASE F — VISUALIZE (you add this)
+-----------------------------------
+  11. Power BI → connect to Snowflake → query Gold marts → build dashboards
+
+PHASE G — AUTOMATE (already done in your repo)
+-----------------------------------------------
+  12. git push to main → GitHub Actions runs CI (test) + CD (deploy dbt)
+
+
+================================================================================
+6. TRACE ONE CUSTOMER RECORD (DO THIS EXERCISE)
+================================================================================
+
+Follow "Jane Doe" through the pipeline:
+
+  STEP 1 — BIRTH
+    faker_generator.py inserts:
+      customers: { first_name: Jane, last_name: Doe, email: jane@... }
+
+  STEP 2 — JOURNAL ENTRY
+    Postgres writes this to its WAL (transaction log).
+
+  STEP 3 — CDC PICKS IT UP
+    Debezium reads WAL → publishes JSON to topic:
+      banking_server.public.customers
+    Payload contains "after": { id, first_name, last_name, email, ... }
+
+  STEP 4 — HIGHWAY
+    Kafka holds the message until consumer reads it.
+
+  STEP 5 — BOXED AND SHELVED
+    kafka_to_minio.py batches messages → Parquet file in MinIO:
+      s3://raw/customers/date=2026-06-14/customers_HHMMSS.parquet
+
+  STEP 6 — TRUCK TO HQ
+    Airflow DAG downloads file → loads into:
+      BANKING.RAW.CUSTOMERS  (Bronze — messy JSON/variant columns)
+
+  STEP 7 — CLEANED UP
+    dbt stg_customers.sql reads raw → creates view with clean columns:
+      customer_id, first_name, last_name, email, created_at
+
+  STEP 8 — HISTORY TRACKED
+    If Jane changes her email later, customers_snapshot (SCD Type-2) keeps
+    OLD row (valid_to = date) and NEW row (valid_to = NULL, is_current = true).
+
+  STEP 9 — BUSINESS TABLE
+    dim_customers.sql → current + historical view for reporting.
+
+  STEP 10 — DASHBOARD
+    Power BI charts: "How many customers?" "Customer growth over time?"
+
+
+================================================================================
+7. MEDALLION ARCHITECTURE (BRONZE → SILVER → GOLD)
+================================================================================
+
+Analogy: Raw ingredients → washed/chopped → plated meal ready to serve.
+
+  BRONZE (Raw)     SILVER (Staging)       GOLD (Marts)
+  ------------     ----------------       --------------
+  As landed        Cleaned, typed         Business-ready
+  Immutable copy   Light transforms     Star schema
+  JSON/variant     Views usually        Tables for BI
+
+  BANKING.RAW.*    stg_customers          dim_customers
+                   stg_accounts           dim_accounts
+                   stg_transactions       fact_transactions
+
+  + snapshots: customers_snapshot, accounts_snapshot (SCD2)
+
+WHY THREE LAYERS:
+  Bronze:  Never lose original data. If transform logic is wrong, replay from raw.
+  Silver:  One clean version everyone trusts. Fix naming/types once here.
+  Gold:    Optimized for questions like "revenue by account type last quarter."
+
+
+================================================================================
+8. KEY CONCEPTS EVERY DATA ENGINEER MUST KNOW
+================================================================================
+
+OLTP vs OLAP
+  OLTP (Postgres):  Many small writes. "Transfer $50 now."
+  OLAP (Snowflake):  Few big reads.  "Total deposits last 12 months by region."
+
+CDC (Change Data Capture)
+  Capture only what CHANGED instead of copying entire database.
+  Analogy: Photocopy only the new diary pages, not the whole book daily.
+
+EVENT-DRIVEN vs BATCH
+  This project is NEAR REAL-TIME (events stream continuously).
+  Airflow Bronze load can still run on a schedule (batch load from MinIO).
+  Real companies often mix both.
+
+SCD TYPE 2 (Slowly Changing Dimension)
+  When customer email changes, keep history:
+    Row 1: jane@old.com   valid_from Jan 1  valid_to Mar 1   (expired)
+    Row 2: jane@new.com   valid_from Mar 1  valid_to NULL    (current)
+  Needed for: "What did we know about this customer AT the time of transaction?"
+
+STAR SCHEMA (Gold layer)
+  FACT table (fact_transactions):  numbers + foreign keys (the "verbs")
+  DIM tables (dim_customers, dim_accounts):  descriptive attributes (the "nouns")
+  BI tools love this shape.
+
+ORCHESTRATION vs TRANSFORMATION
+  Airflow = WHEN and IN WHAT ORDER (orchestration)
+  dbt     = WHAT SQL to run (transformation)
+  Don't confuse them in interviews.
+
+KEY-PAIR AUTH (your Snowflake setup)
+  Snowflake MFA blocks password login from scripts.
+  RSA private key = machine identity. Airflow and GitHub Actions use the .p8 key.
+
+
+================================================================================
+9. WHAT EACH FOLDER/FILE DOES
+================================================================================
+
+  postgres/schema.sql
+    DDL for customers, accounts, transactions. Run on fresh DB.
+
+  data-generator/faker_generator.py
+    Creates synthetic banking data. Runs in a loop or --once.
+
+  kafka-debezium/generate_and_post_connector.py
+    POSTs Debezium connector config to localhost:8083.
+
+  consumer/kafka_to_minio.py
+    Kafka consumer → Parquet writer → MinIO. Must stay running.
+
+  docker-compose.yml
+    Defines all containers: zookeeper, kafka, connect, postgres, minio, airflow.
+
+  docker-compose.override.yml  (local only, gitignored)
+    Your Windows fixes: Postgres port 5434, Kafka localhost:29092.
+
+  docker/dags/minio_to_snowflake_dag.py
+    Airflow: MinIO → Snowflake Bronze load. Uses RSA key-pair.
+
+  docker/dags/scd_snapshots.py
+    Airflow: scheduled dbt snapshot + marts.
+
+  docker/dags/.env
+    Snowflake + MinIO credentials for DAGs (never commit).
+
+  docker/dags/secrets/rsa_key.p8
+    Snowflake private key (never commit).
+
+  banking_dbt/
+    All dbt models, snapshots, dbt_project.yml.
+
+  banking_dbt/.dbt/profiles.yml
+    Local dbt connection to Snowflake (never commit).
+
+  banking_dbt/run_dbt.ps1
+    Runs dbt inside Airflow Docker container (Windows-friendly).
+
+  .github/workflows/ci.yml
+    Lint, Postgres test, dbt parse/compile on push.
+
+  .github/workflows/cd.yml
+    Deploy dbt to Snowflake on push to main.
+
+  docs/architecture.png
+    Pipeline diagram for README.
+
+
+================================================================================
+10. WHO DOES WHAT: AIRFLOW vs dbt vs PYTHON SCRIPTS
+================================================================================
+
+  +---------------------------+------------------------+------------------+
+  | Tool                      | Role                   | Analogy          |
+  +---------------------------+------------------------+------------------+
+  | faker_generator.py        | Create source data     | Fake customers   |
+  | Debezium                  | Detect DB changes      | Security camera  |
+  | kafka_to_minio.py         | Stream → files         | Packer at dock   |
+  | Airflow                   | Schedule & coordinate  | Project manager|
+  | dbt                       | SQL transforms         | Data analyst team|
+  | GitHub Actions            | Auto test & deploy     | QA + release mgr |
+  | Power BI                  | Visualize              | Executive report |
+  +---------------------------+------------------------+------------------+
+
+RULE: If it's "run this SQL to build a table" → dbt.
+      If it's "run job B after job A every hour" → Airflow.
+      If it's "listen to Kafka and write files" → Python consumer.
+
+
+================================================================================
+11. YOUR WINDOWS-SPECIFIC SETUP (IMPORTANT)
+================================================================================
+
+POSTGRES PORT: 5434 (not 5432)
+  You have PostgreSQL 18 installed locally on 5432.
+  docker-compose.override.yml maps banking Postgres to 5434.
+  DBeaver + data-generator/.env must use port 5434.
+
+KAFKA BOOTSTRAP: localhost:29092
+  consumer/.env → KAFKA_BOOTSTRAP=localhost:29092
+  (Inside Docker, services use kafka:9092)
+
+PYTHON "NOT FOUND" FIX
+  Windows doesn't have `python` on PATH by default.
+  Try one of these:
+
+    py -3.11 kafka-debezium/generate_and_post_connector.py
+    py -3.11 consumer/kafka_to_minio.py
+    py -3.11 data-generator/faker_generator.py
+
+  OR use Anaconda (you have anaconda3 installed):
+
+    C:\Users\John Lopez\anaconda3\python.exe consumer\kafka_to_minio.py
+
+  OR activate conda env first:
+
+    conda activate base
+    pip install -r requirements.txt
+    python consumer/kafka_to_minio.py
+
+  Install deps once:
+    pip install -r requirements.txt
+
+TWO SEPARATE POSTGRES DATABASES IN DOCKER
+  postgres (banking)       → port 5434 — YOUR PROJECT DATA
+  airflow-postgres         → port 5433 — Airflow's internal metadata only
+  Don't confuse them.
+
+
+================================================================================
+12. DAILY STARTUP CHECKLIST (TOMORROW MORNING)
+================================================================================
+
+  [ ] 1. Open Docker Desktop → wait until Running
+
+  [ ] 2. Terminal:
+         cd "C:\Users\John Lopez\banking-modern-datastack"
+         docker compose up -d
+         docker compose ps    (all should say Up)
+
+  [ ] 3. Check Debezium connector:
+         browser → http://localhost:8083/connectors
+         If missing, run:
+         py -3.11 kafka-debezium/generate_and_post_connector.py
+
+  [ ] 4. Terminal 1 (leave open — consumer):
+         cd consumer
+         py -3.11 kafka_to_minio.py
+         Expect: "Connected to Kafka. Listening for messages..."
+
+  [ ] 5. Terminal 2 (optional — generate data):
+         cd data-generator
+         py -3.11 faker_generator.py --once
+
+  [ ] 6. Airflow → http://localhost:8080
+         Turn ON + Trigger: minio_to_snowflake_banking
+
+  [ ] 7. dbt (if new raw data loaded):
+         cd banking_dbt
+         .\run_dbt.ps1 all
+
+  TO STOP TONIGHT:
+         Ctrl+C in consumer/generator terminals
+         docker compose down        (NO -v unless you want wipe everything)
+
+
+================================================================================
+13. CI/CD — WHAT GITHUB ACTIONS DOES FOR YOU
+================================================================================
+
+On every push to main:
+
+  CI (Continuous Integration — "is the code healthy?")
+    - Lint Python (ruff)
+    - Postgres integration (applies schema.sql, checks tables exist)
+    - dbt parse (validates project structure)
+    - dbt compile (validates against Snowflake with your secrets)
+
+  CD (Continuous Deployment — "push transforms to production")
+    - dbt run → staging
+    - dbt snapshot → SCD2
+    - dbt run --select marts → Gold tables
+    - dbt test
+
+Secrets stored in GitHub (not in code):
+  SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_WAREHOUSE, SNOWFLAKE_PRIVATE_KEY
+  POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+
+Green checkmark on GitHub = pipeline healthy.
+Red X = something broke (click Actions tab for logs).
+
+
+================================================================================
+14. WHAT'S DONE vs WHAT'S LEFT
+================================================================================
+
+  DONE:
+    [x] Docker stack (Postgres, Kafka, Debezium, MinIO, Airflow)
+    [x] CDC pipeline
+    [x] Kafka → MinIO consumer
+    [x] Airflow → Snowflake Bronze load
+    [x] dbt Silver + Gold + SCD2 snapshots
+    [x] Snowflake key-pair auth
+    [x] GitHub repo + README + architecture diagram
+    [x] CI/CD passing
+
+  OPTIONAL / LEFT:
+    [ ] Enable SCD2_snapshots Airflow DAG (auto daily snapshots)
+    [ ] Power BI dashboards (connect to dim_* and fact_* in Snowflake)
+    [ ] Fix local Python PATH permanently (py launcher or conda)
+    [ ] Delete old archive repo: lopez-banking-modern-datastack-archive
+
+
+================================================================================
+15. INTERVIEW PITCH (30 SECONDS — MEMORIZE THIS)
+================================================================================
+
+  "I built an end-to-end banking data pipeline. PostgreSQL simulates a live
+   OLTP system. Debezium captures changes in real time through Kafka, a Python
+   consumer lands Parquet files in MinIO, and Airflow orchestrates loads into
+   Snowflake's raw layer. I modeled the data with dbt using medallion
+   architecture — staging views, SCD Type-2 snapshots for customer history,
+   and star-schema marts for analytics. I containerized the stack with Docker,
+   solved Windows and Snowflake MFA auth with key-pair integration, and
+   automated deployments with GitHub Actions CI/CD."
+
+
+================================================================================
+16. SELF-TEST QUIZ (COVER ANSWERS, THEN CHECK)
+================================================================================
+
+  Q1.  What are the 3 OLTP tables?
+  Q2.  What does Debezium read from Postgres?
+  Q3.  Why use MinIO instead of loading Kafka directly into Snowflake?
+  Q4.  What Snowflake schema is Bronze?
+  Q5.  Difference between stg_customers and dim_customers?
+  Q6.  What is SCD Type 2 used for in this project?
+  Q7.  What does the minio_to_snowflake_banking DAG do?
+  Q8.  What's the difference between CI and CD?
+  Q9.  Why key-pair auth for Snowflake instead of password?
+  Q10. Why must Docker run before the Python consumer?
+  Q11. What port is banking Postgres on YOUR machine?
+  Q12. What tool would you use for "run staging SQL every day at 6am"?
+
+  ANSWERS:
+  A1.  customers, accounts, transactions
+  A2.  WAL (Write-Ahead Log) via logical replication
+  A3.  Decoupling, cheap durable storage, replayable raw landing zone
+  A4.  BANKING.RAW
+  A5.  stg = cleaned view from raw; dim = business dimension with SCD2 history
+  A6.  Track historical changes when customer/account attributes change
+  A7.  Downloads Parquet from MinIO, loads into Snowflake raw tables
+  A8.  CI = test/validate code; CD = deploy dbt models to Snowflake
+  A9.  MFA blocks password-only login from Airflow/GitHub Actions scripts
+  A10. Kafka and MinIO run inside Docker containers — they don't exist without it
+  A11. 5434 (docker-compose.override.yml)
+  A12. Airflow (orchestration). dbt writes the SQL; Airflow schedules it.
+
+
+================================================================================
+17. LEARNING MILESTONES — HOW TO KNOW YOU TRULY UNDERSTAND
+================================================================================
+
+  LEVEL 1 — Can run it
+    You can start Docker, consumer, generator, Airflow, dbt without help.
+
+  LEVEL 2 — Can explain it
+    You can draw the pipeline on a whiteboard from memory with analogies.
+
+  LEVEL 3 — Can debug it
+    When MinIO is empty, Kafka fails, or Snowflake rejects auth — you know
+    WHICH LAYER broke and what to check first.
+
+  LEVEL 4 — Can design it
+    Someone asks "why not use X instead of Y?" — you give a real tradeoff answer.
+
+  LEVEL 5 — Can extend it
+    You could add a new table (e.g., loans), wire CDC, add dbt models, and
+    update CI — without following a tutorial step-by-step.
+
+  TRY THIS to reach Level 3:
+    Stop the consumer → generate data → confirm MinIO stays empty → restart
+    consumer → confirm files appear. You just proved you understand layer 5.
+
+
+================================================================================
+18. COMMON FAILURES AND WHAT THEY MEAN
+================================================================================
+
+  "Python was not found"
+    → Use py -3.11 or Anaconda path (Section 11)
+
+  "NoBrokersAvailable" (Kafka)
+    → Docker not running, or wrong bootstrap (must be localhost:29092)
+
+  DBeaver auth failed on 5432
+    → Use port 5434 for banking Postgres
+
+  MinIO bucket empty
+    → Consumer not running, or no new data in Kafka
+
+  Airflow Snowflake MFA error
+    → Need RSA key at docker/dags/secrets/rsa_key.p8
+
+  dbt dim models fail
+    → Run snapshots BEFORE marts: run → snapshot → run --select marts
+
+  GitHub Actions red X on first push
+    → Secrets not set yet; re-run after secrets configured
+
+  Contributors show wrong people on GitHub
+    → Old repo history; your fresh repo fixes this (already done)
+
+
+================================================================================
+19. STUDY PLAN (1 WEEK)
+================================================================================
+
+  DAY 1 — Read Sections 1–4 of this guide. Start Docker. Explore Airflow UI.
+  DAY 2 — Run full pipeline once. Do the "trace one customer" exercise (Sec 6).
+  DAY 3 — Open each dbt model SQL file. Explain what each line does out loud.
+  DAY 4 — Break something on purpose (stop consumer). Fix it. (Section 17 Level 3)
+  DAY 5 — Read Airflow DAG code. Explain download_minio vs load_snowflake.
+  DAY 6 — Walk through GitHub Actions logs. Explain CI vs CD.
+  DAY 7 — Build Power BI dashboard. Practice interview pitch (Section 15).
+
+  After 7 days, take the quiz (Section 16) without looking at answers.
+  Score 10/12 or higher = you genuinely understand this project.
+
+
+================================================================================
+END OF GUIDE — You've got this, John.
+Questions? Re-read Section 6 (trace one record) — that's where it clicks.
+================================================================================
